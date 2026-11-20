@@ -28,6 +28,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
+const net = require('net');
 const https = require('https');
 const { Readable } = require('stream');
 const { fetch: ufetch, ProxyAgent } = require('undici');
@@ -165,11 +166,42 @@ function buildFormats(list) {
   return { video, audio };
 }
 
+// Proxy reachability: on some hosts (e.g. Cloady) the Webshare proxy
+// ports are blocked, so EVERY proxied yt-dlp attempt hangs until its
+// socket timeout — ~25s wasted on every lookup before the direct fallback
+// even starts. That is why "Finding your video…" felt endless. We probe
+// the proxy with a fast raw TCP connect (3s) at startup and every 5 min;
+// while it is unreachable, proxyArgs() returns [] so every attempt goes
+// direct, and the formats loop returns the first usable result instead
+// of chasing higher qualities that a direct IP can never see.
+let proxyReachable = true;
+function proxyList() {
+  return (process.env.YTDLP_PROXY || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+function checkProxyReachability() {
+  return new Promise((resolve) => {
+    const proxies = proxyList();
+    if (!proxies.length) { proxyReachable = false; return resolve(false); }
+    let target = proxies[0];
+    try {
+      const u = new URL(target);
+      const host = u.hostname;
+      const port = parseInt(u.port || '80', 10);
+      const sock = net.connect({ host, port });
+      const timer = setTimeout(() => { try { sock.destroy(); } catch (e) { /* ignore */ } proxyReachable = false; resolve(false); }, 3000);
+      sock.on('connect', () => { clearTimeout(timer); try { sock.destroy(); } catch (e) { /* ignore */ } proxyReachable = true; resolve(true); });
+      sock.on('error', () => { clearTimeout(timer); proxyReachable = false; resolve(false); });
+    } catch (e) { proxyReachable = false; resolve(false); }
+  });
+}
 function proxyArgs() {
   // Proxy pool (IP rotation): YTDLP_PROXY = one proxy URL or a
   // comma-separated list to rotate the egress IP per request. Without it,
   // every request leaves from the same server IP and platforms can block it.
-  const proxies = (process.env.YTDLP_PROXY || '').split(',').map(s => s.trim()).filter(Boolean);
+  // When the proxy is unreachable from this host, skip it entirely — every
+  // proxied attempt would just hang until its timeout.
+  if (!proxyReachable) return [];
+  const proxies = proxyList();
   return proxies.length ? ['--proxy', proxies[Math.floor(Math.random() * proxies.length)]] : [];
 }
 
@@ -310,8 +342,12 @@ app.post('/api/formats', async (req, res) => {
         // ever returns itag 18 (360p), so without this the user never sees
         // 720p/1080p or a working audio-only option. Applies whenever it's
         // YouTube and only 360p with no audio (no deep flag required).
+        // BUT only chase while the proxy is reachable: from a direct
+        // datacenter IP every client returns the same 360p, so chasing
+        // web/tv after android just burns ~20s for nothing. When the proxy
+        // is down, return the first usable result right away.
         const onlyLow = isYT && !f.video.some(v => (v.height || 0) > 360) && !f.audio.length;
-        if (onlyLow) {
+        if (onlyLow && proxyReachable) {
           const n = f.video.length + f.audio.length;
           if (n > bestCount) { bestCount = n; bestData = data; }
           data = null;
@@ -729,6 +765,12 @@ app.get('/api/stream', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log('fastvideodown-api listening on port ' + PORT);
+// Probe the proxy BEFORE serving, so the very first lookup already knows
+// whether to go direct. Re-probe every 5 minutes in case it comes back.
+checkProxyReachability().then((ok) => {
+  console.log('proxy reachable: ' + ok);
+  app.listen(PORT, () => {
+    console.log('fastvideodown-api listening on port ' + PORT);
+  });
+  setInterval(() => { checkProxyReachability().then((ok) => console.log('proxy recheck: ' + ok)); }, 5 * 60 * 1000);
 });
