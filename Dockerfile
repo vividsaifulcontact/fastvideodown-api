@@ -12,15 +12,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # App code + fetch scripts.
-COPY package.json server.js fetch-ytdlp.sh fetch-ffmpeg.sh ./
-RUN chmod +x fetch-ytdlp.sh fetch-ffmpeg.sh
+COPY package.json server.js fetch-ytdlp.sh fetch-ffmpeg.sh fetch-chromium.sh ./
+RUN chmod +x fetch-ytdlp.sh fetch-ffmpeg.sh fetch-chromium.sh
 
-# Node dependencies (express, undici).
+# Node dependencies (express, undici, playwright).
 RUN npm install --no-audit --no-fund
 
 # yt-dlp binary + static ffmpeg (downloaded fresh at build time;
 # the repo does not store the binaries).
 RUN bash fetch-ytdlp.sh && bash fetch-ffmpeg.sh
+
+# Playwright Chromium for headless-browser automation (dlsrv/Cap check).
+RUN bash fetch-chromium.sh
 
 # Hugging Face Spaces serves the container on port 7860.
 ENV PORT=7860
