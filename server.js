@@ -377,6 +377,69 @@ app.post('/api/formats', async (req, res) => {
   });
 });
 
+// Extract just the audio track from a video and return { file, cleanup }.
+// Used by /api/download when no audio-only stream exists (datacenter IPs
+// only see the combined 360p file, but it DOES carry an audio track).
+// Downloads the best audio-carrying format with yt-dlp, then pulls the
+// audio out with ffmpeg — AAC copied untouched when possible (.m4a), else
+// re-encoded to AAC (.m4a). Returns null when it cannot produce a file.
+function findFfmpeg() {
+  const c = path.join(__dirname, 'bin', 'ffmpeg');
+  try { if (fs.existsSync(c)) return c; } catch (e) { /* next */ }
+  return 'ffmpeg';
+}
+function runCmd(cmd, args, timeoutMs, envExtra) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, {
+      timeout: timeoutMs,
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, HOME: '/tmp', XDG_CACHE_HOME: '/tmp/.cache', YTDLP_NO_UPDATE: '1', ...(envExtra || {}) },
+    }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
+}
+async function extractAudio(url, title) {
+  const src = findBinarySrc();
+  if (!src) return null;
+  const tag = process.pid + '-' + crypto.randomBytes(4).toString('hex');
+  const tmpDir = '/tmp/audio-' + tag;
+  try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) { /* ignore */ }
+  const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* ignore */ } };
+  const pArgs = proxyArgs();
+  const dlArgs = [
+    '-f', 'best',
+    '--no-playlist', '--no-warnings',
+    '--socket-timeout', '10', '--retries', '1',
+    '--js-runtimes', 'node', '--remote-components', 'ejs:github',
+    '--extractor-args', 'youtube:player_client=web,android',
+    '-o', tmpDir + '/video.%(ext)s',
+    ...pArgs, url,
+  ];
+  const envExtra = { TMPDIR: tmpDir, PATH: path.join(__dirname, 'bin') + ':' + (process.env.PATH || '') };
+  let dl = await runCmd(src, dlArgs, 300000, envExtra);
+  if (dl.err && pArgs.length) {
+    const noProxy = dlArgs.filter(a => !pArgs.includes(a));
+    dl = await runCmd(src, noProxy, 300000, envExtra);
+  }
+  if (dl.err) { cleanup(); return null; }
+  let video = null;
+  try {
+    const files = fs.readdirSync(tmpDir).filter(f => /\.(mp4|mkv|webm|mov)$/i.test(f));
+    if (files.length) video = path.join(tmpDir, files[0]);
+  } catch (e) { /* ignore */ }
+  if (!video) { cleanup(); return null; }
+  const ffmpeg = findFfmpeg();
+  const out = path.join(tmpDir, 'audio.m4a');
+  // 1) copy the AAC track untouched (fast, original quality).
+  let conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'copy', '-y', out], 180000, envExtra);
+  // 2) if the track is not AAC, re-encode it to AAC.
+  if (conv.err) {
+    conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'aac', '-b:a', '192k', '-y', out], 180000, envExtra);
+  }
+  if (conv.err) { cleanup(); return null; }
+  try { if (!fs.existsSync(out) || fs.statSync(out).size < 1000) { cleanup(); return null; } } catch (e) { cleanup(); return null; }
+  return { file: out, cleanup };
+}
+
 // ---------- POST /api/download ----------
 // Body: { url, formatId, ext?, title?, proxy? }
 // Returns { ok, url, filename } or { ok:false, error, detail }.
@@ -467,6 +530,30 @@ app.post('/api/download', async (req, res) => {
     }
   }
   if (!/^https?:\/\//.test(direct)) {
+    // AUDIO FALLBACK (ffmpeg extraction): on hosts whose IP only gets the
+    // combined 360p format (itag 18) and NO audio-only stream, the strict
+    // bestaudio[vcodec=none] lookup above finds nothing, so "Audio only"
+    // would always fail. But itag 18 DOES contain an audio track — download
+    // that file and strip the audio out with ffmpeg, then stream the .m4a
+    // straight back. The frontend already saves a binary /api/download
+    // response as a file, so no frontend change is needed.
+    if (isAudio) {
+      const audioFile = await extractAudio(url, title);
+      if (audioFile) {
+        const fname = safeName(title, 'm4a').replace(/"/g, '');
+        res.set('Content-Type', 'audio/mp4');
+        res.set('Content-Disposition', 'attachment; filename="' + fname + '"');
+        res.set('Access-Control-Allow-Origin', '*');
+        try { res.set('Content-Length', String(fs.statSync(audioFile.file).size)); } catch (e) { /* ignore */ }
+        res.status(200);
+        const stream = fs.createReadStream(audioFile.file);
+        stream.on('error', () => { audioFile.cleanup(); try { res.end(); } catch (e) { /* ignore */ } });
+        stream.on('end', audioFile.cleanup);
+        res.on('close', audioFile.cleanup);
+        stream.pipe(res);
+        return;
+      }
+    }
     const s = (stderr || '').toLowerCase();
     const error = s.includes('binary_not_found') || s.includes('binary_prepare_failed')
       ? 'Download engine is not available on the server right now.'
