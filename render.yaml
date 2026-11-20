@@ -1,0 +1,19 @@
+# Render blueprint for the FastVideoDown download API.
+# Deploy via: Render dashboard -> New -> Web Service -> connect the repo
+# (or "New from Blueprint" with this file). Free plan, no card needed.
+services:
+  - type: web
+    name: fastvideodown-api
+    env: node
+    plan: free
+    buildCommand: bash fetch-ytdlp.sh && bash fetch-ffmpeg.sh && npm install --no-audit --no-fund
+    startCommand: node server.js
+    envVars:
+      # YTDLP_PROXY is set in the Render dashboard (not in the repo): the
+      # comma-separated Webshare proxy list
+      # (http://user:pass@IP:PORT,http://user:pass@IP:PORT,...).
+      # It rotates the egress IP per yt-dlp invocation and lets /api/stream
+      # fetch through the exact proxy IP a YouTube CDN URL was issued for.
+      # sync: false means Render will not overwrite the dashboard value.
+      - key: YTDLP_PROXY
+        sync: false
