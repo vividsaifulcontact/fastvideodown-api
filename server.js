@@ -420,21 +420,29 @@ app.get('/api/dlsrv-test', async (req, res) => {
   try {
     const { chromium } = require('playwright');
     browser = await chromium.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
     });
     const page = await browser.newPage();
+    // Hide the headless/automation flags so the Cap check sees a real browser.
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      window.chrome = window.chrome || { runtime: {} };
+    });
     await page.goto(`https://embed.dlsrv.online/v1/full?videoId=${videoId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    // Wait for the Cap check to solve and the session token to be stored.
+    // Wait up to 120s for the Cap check to solve and the session token to appear
+    // (in sessionStorage or localStorage). The PoW is slow on a 0.5 vCPU box.
     let token = null;
-    for (let i = 0; i < 30; i++) {
-      token = await page.evaluate(() => sessionStorage.getItem('__session')).catch(() => null);
+    let pageText = '';
+    for (let i = 0; i < 60; i++) {
+      token = await page.evaluate(() => sessionStorage.getItem('__session') || localStorage.getItem('__session')).catch(() => null);
       if (token) break;
       await page.waitForTimeout(2000);
     }
     const ms = Date.now() - t0;
     if (!token) {
+      pageText = await page.evaluate(() => document.body.innerText.slice(0, 300)).catch(() => '');
       await browser.close();
-      return res.json({ ok: false, videoId, ms, error: 'No session token after 60s — Cap check did not solve (blocked or headless detected).' });
+      return res.json({ ok: false, videoId, ms, pageText, error: 'No session token after 120s — Cap check did not solve (blocked, headless detected, or PoW too slow on this CPU).' });
     }
     // Call the download API with the session token.
     const dl = await fetch('https://embed.dlsrv.online/api/v3/download', {
