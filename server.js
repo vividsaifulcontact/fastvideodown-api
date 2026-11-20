@@ -82,17 +82,32 @@ function runYtDlp(args, timeoutMs) {
 
 // ---------- shared helpers (from formats function) ----------
 
-function classifyError(stderr) {
+function platformName(url) {
+  const u = (url || '').toLowerCase();
+  if (/youtu\.?be|youtube\.com/.test(u)) return 'YouTube';
+  if (/tiktok\.com/.test(u)) return 'TikTok';
+  if (/facebook\.com|fb\.watch/.test(u)) return 'Facebook';
+  if (/instagram\.com/.test(u)) return 'Instagram';
+  if (/(x\.com|twitter\.com)/.test(u)) return 'X';
+  if (/reddit\.com/.test(u)) return 'Reddit';
+  if (/vimeo\.com/.test(u)) return 'Vimeo';
+  if (/dailymotion\.com/.test(u)) return 'Dailymotion';
+  return 'This platform';
+}
+
+function classifyError(stderr, url) {
   const s = (stderr || '').toLowerCase();
+  const platform = platformName(url);
   if (s.includes('binary_not_found') || s.includes('binary_prepare_failed'))
     return { code: 'engine_error', error: 'Download engine is not available on the server right now.' };
   if (s.includes('ip address is blocked') || s.includes('blocked from accessing'))
-    return { code: 'ip_blocked', error: 'This platform blocked the server (IP blocked). Try another link or try again later.' };
-  // YouTube's anti-bot screen ("Sign in to confirm you're not a bot") is NOT
-  // a private video — the video is public, YouTube is just refusing the
-  // server's IP. Say so plainly instead of claiming it needs a login.
+    return { code: 'ip_blocked', error: platform + ' blocked the server (IP blocked). Try another link or try again later.' };
+  // A bot-check screen ("Sign in to confirm you're not a bot") is NOT a
+  // private video — the video is public, the platform is just refusing
+  // the server's IP. Name the ACTUAL platform from the URL: a TikTok link
+  // must never report a "YouTube" block.
   if (s.includes('not a bot') || s.includes('sign in to confirm') || s.includes('confirm you'))
-    return { code: 'bot_check', error: 'YouTube blocked this request from our server (it asked to sign in to prove it is not a bot). The video itself is public — please try again later, or try a different video.' };
+    return { code: 'bot_check', error: platform + ' blocked this request from our server (it asked to sign in to prove it is not a bot). The video itself is public — please try again later, or try a different video.' };
   if (s.includes('login required') || s.includes('log in') || s.includes('cookies') || s.includes('sign in to confirm'))
     return { code: 'login_required', error: 'This link needs a logged-in account (private / login-only content).' };
   if (s.includes('unsupported url') || s.includes('no video') || s.includes('not a valid url'))
@@ -473,7 +488,7 @@ app.post('/api/formats', async (req, res) => {
   }
 
   if (!data) {
-    const c = classifyError(lastErr);
+    const c = classifyError(lastErr, url);
     return res.status(200).json({ ok: false, ...c, detail: (lastErr || '').slice(0, 300) });
   }
 
@@ -679,7 +694,7 @@ app.post('/api/download', async (req, res) => {
     const s = (stderr || '').toLowerCase();
     const error = s.includes('binary_not_found') || s.includes('binary_prepare_failed')
       ? 'Download engine is not available on the server right now.'
-      : s.includes('not a bot') || s.includes('sign in to confirm') ? 'YouTube blocked this request from our server (bot check). The video itself is public — please try again later, or try a different video.'
+      : s.includes('not a bot') || s.includes('sign in to confirm') ? platformName(url) + ' blocked this request from our server (bot check). The video itself is public — please try again later, or try a different video.'
       : s.includes('blocked') ? 'This platform blocked the server. Try again later.'
       : s.includes('login') || s.includes('cookies') ? 'This link needs a logged-in account.'
       : 'Could not get a download link for this format. Please try again.';
@@ -764,7 +779,7 @@ app.get('/api/merge', async (req, res) => {
     cleanup();
     const s = (merged.stderr || '').toLowerCase();
     const error = s.includes('not a bot') || s.includes('sign in to confirm')
-      ? 'YouTube blocked this request from our server (bot check). The video itself is public — please try again later, or try a different video.'
+      ? platformName(url) + ' blocked this request from our server (bot check). The video itself is public — please try again later, or try a different video.'
       : s.includes('ffmpeg') || s.includes('ffprobe')
         ? 'The server could not merge the video and audio (ffmpeg unavailable). Try a lower quality with sound instead.'
         : 'Could not prepare this quality with sound. Please try again or pick a lower quality.';
