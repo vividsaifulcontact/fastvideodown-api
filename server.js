@@ -329,6 +329,37 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---------- GET /api/proxy-test ----------
+// Test ONE proxy: run a YouTube formats lookup through ONLY that proxy
+// and report the heights found + time. Used to find free proxies that
+// return higher qualities than the direct datacenter IP (360p only).
+//   GET /api/proxy-test?proxy=<proxy url>&url=<video url>
+app.get('/api/proxy-test', async (req, res) => {
+  const proxy = (req.query.proxy || '').trim();
+  const url = (req.query.url || 'https://youtu.be/aLd66fzW6sE').trim();
+  if (!/^https?:\/\/.+/i.test(proxy) || !/^https?:\/\/.+/i.test(url)) {
+    return res.status(400).json({ ok: false, error: 'Missing proxy or url' });
+  }
+  const t0 = Date.now();
+  const args = ['-J', '--no-playlist', '--skip-download', '--no-warnings',
+    '--socket-timeout', '8', '--retries', '1',
+    '--extractor-args', 'youtube:player_client=android',
+    '--proxy', proxy, url];
+  const { stdout, stderr } = await runYtDlp(args, 20000);
+  const ms = Date.now() - t0;
+  let data = null;
+  if (stdout) { try { data = JSON.parse(stdout); } catch (e) { data = null; } }
+  if (!data) {
+    return res.json({ ok: false, proxy, ms, error: (stderr || '').slice(0, 200) });
+  }
+  const f = buildFormats(data.formats);
+  res.json({
+    ok: true, proxy, ms,
+    heights: f.video.map(v => v.height + (v.hasAudio ? 'p+sound' : 'p')),
+    audio: f.audio.length,
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'fastvideodown-api' });
 });
