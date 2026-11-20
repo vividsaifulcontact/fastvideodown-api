@@ -324,6 +324,24 @@ app.post('/api/formats', async (req, res) => {
   }
   if (!data) data = bestData;
 
+  // DIRECT FALLBACK: every attempt above goes through the Webshare proxy.
+  // On some hosts (e.g. Cloady) the proxy itself is unreachable, so ALL
+  // proxied attempts fail even though the server's own network works fine
+  // (the thumbnail stream, which fetches directly, proves it). If nothing
+  // came back, try once more with NO proxy, straight from the server IP.
+  // A datacenter IP may only return 360p on YouTube, but a working 360p
+  // beats a total failure.
+  if (!data) {
+    const directArgs = ['-J', '--no-playlist', '--skip-download', '--no-warnings',
+      '--socket-timeout', '8', '--retries', '1',
+      '--extractor-args', 'youtube:player_client=android', url];
+    const { stdout, stderr } = await runYtDlp(directArgs, 9000);
+    lastErr = stderr || '';
+    if (stdout) {
+      try { data = JSON.parse(stdout); } catch (e) { data = null; }
+    }
+  }
+
   if (!data) {
     const c = classifyError(lastErr);
     return res.status(200).json({ ok: false, ...c, detail: (lastErr || '').slice(0, 300) });
@@ -415,6 +433,20 @@ app.post('/api/download', async (req, res) => {
     }
   }
   if (!/^https?:\/\//.test(direct)) {
+    // DIRECT FALLBACK (same reason as /api/formats): if the Webshare proxy
+    // is unreachable from this host, every proxied attempt fails. Try once
+    // with NO proxy, straight from the server IP.
+    const directAttempt = ['-g', '-f', formatId, '--no-playlist', '--no-warnings',
+      '--socket-timeout', '8', '--retries', '1',
+      '--extractor-args', 'youtube:player_client=android', url];
+    const r = await runYtDlp(directAttempt, 9000);
+    stderr = r.stderr || stderr;
+    const cand = (r.stdout || '').trim().split('\n')[0] || '';
+    if (/^https?:\/\//.test(cand) && !(isAudio && /[?&]mime=video%2F/i.test(cand))) {
+      direct = cand;
+    }
+  }
+  if (!/^https?:\/\//.test(direct)) {
     const s = (stderr || '').toLowerCase();
     const error = s.includes('binary_not_found') || s.includes('binary_prepare_failed')
       ? 'Download engine is not available on the server right now.'
@@ -481,14 +513,24 @@ app.get('/api/merge', async (req, res) => {
     ...pArgs, url,
   ];
   // Generous timeout: a merge downloads two streams and muxes them.
-  const merged = await new Promise((resolve) => {
-    execFile(src, args, {
+  const runMerge = (useProxy) => new Promise((resolve) => {
+    // Without proxy: drop the '--proxy' flag AND its URL value (both live
+    // in pArgs) so yt-dlp runs straight from the server IP.
+    const runArgs = useProxy ? args : args.filter(a => !pArgs.includes(a));
+    execFile(src, runArgs, {
       timeout: 540000,
       maxBuffer: 10 * 1024 * 1024,
       // yt-dlp finds ffmpeg on PATH — the static build lives in ./bin.
       env: { ...process.env, HOME: '/tmp', XDG_CACHE_HOME: '/tmp/.cache', YTDLP_NO_UPDATE: '1', TMPDIR: tmpDir, PATH: path.join(__dirname, 'bin') + ':' + (process.env.PATH || '') },
     }, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
   });
+  let merged = await runMerge(true);
+  // DIRECT FALLBACK: if the proxy is unreachable from this host, the merge
+  // fails even though the server's own network works. Retry once with NO
+  // proxy, straight from the server IP.
+  if (merged.err && pArgs.length) {
+    merged = await runMerge(false);
+  }
   if (merged.err) {
     cleanup();
     const s = (merged.stderr || '').toLowerCase();
