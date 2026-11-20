@@ -328,11 +328,13 @@ app.post('/api/formats', async (req, res) => {
   // goes first with a generous timeout and returns immediately when it
   // yields usable formats. BUT android must not be the ONLY attempt: if
   // it is bot-checked or fails, there is no fallback and the lookup fails
-  // outright. Keep web + no-cert behind it as fallbacks — they only run
+  // outright. Keep the mid client behind it as a fallback — it only runs
   // when android fails, so the fast path stays fast and a blocked android
-  // does not mean a failed lookup.
+  // does not mean a failed lookup. (mid is the X syndication endpoint for
+  // X/Twitter — without it X can never work — and the web client for
+  // everything else.)
   const attempts = !proxyReachable
-    ? [{ a: androidArgs, t: 15000 }, { a: webArgs, t: 12000 }, { a: androidNoCertArgs, t: 5000 }]
+    ? [{ a: androidArgs, t: 15000 }, mid, { a: androidNoCertArgs, t: 5000 }]
     : deep
       ? (isYT
         ? [{ a: webArgs, t: 9000 }, { a: tvArgs, t: 6000 }, { a: androidArgs, t: 5000 }, { a: androidNoCertArgs, t: 5000 }]
