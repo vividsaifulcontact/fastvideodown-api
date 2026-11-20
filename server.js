@@ -420,7 +420,7 @@ app.get('/api/dlsrv-test', async (req, res) => {
   try {
     const { chromium } = require('playwright');
     browser = await chromium.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-blink-features=AutomationControlled'],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
     const page = await browser.newPage();
     // Hide the headless/automation flags so the Cap check sees a real browser.
