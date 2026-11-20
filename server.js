@@ -28,7 +28,6 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
-const net = require('net');
 const https = require('https');
 const { Readable } = require('stream');
 const { fetch: ufetch, ProxyAgent } = require('undici');
@@ -169,30 +168,36 @@ function buildFormats(list) {
 // Proxy reachability: on some hosts (e.g. Cloady) the Webshare proxy
 // ports are blocked, so EVERY proxied yt-dlp attempt hangs until its
 // socket timeout — ~25s wasted on every lookup before the direct fallback
-// even starts. That is why "Finding your video…" felt endless. We probe
-// the proxy with a fast raw TCP connect (3s) at startup and every 5 min;
-// while it is unreachable, proxyArgs() returns [] so every attempt goes
-// direct, and the formats loop returns the first usable result instead
-// of chasing higher qualities that a direct IP can never see.
+// even starts. That is why "Finding your video…" felt endless. A raw TCP
+// connect is NOT enough to prove the proxy works (the port can accept a
+// connection while the proxy itself never answers), so we prove it with a
+// real HTTPS request through the proxy instead. While it is unreachable,
+// proxyArgs() returns [] so every attempt goes direct, and the formats
+// loop returns the first usable result instead of chasing higher qualities
+// that a direct IP can never see.
 let proxyReachable = true;
 function proxyList() {
   return (process.env.YTDLP_PROXY || '').split(',').map(s => s.trim()).filter(Boolean);
 }
-function checkProxyReachability() {
-  return new Promise((resolve) => {
-    const proxies = proxyList();
-    if (!proxies.length) { proxyReachable = false; return resolve(false); }
-    let target = proxies[0];
-    try {
-      const u = new URL(target);
-      const host = u.hostname;
-      const port = parseInt(u.port || '80', 10);
-      const sock = net.connect({ host, port });
-      const timer = setTimeout(() => { try { sock.destroy(); } catch (e) { /* ignore */ } proxyReachable = false; resolve(false); }, 3000);
-      sock.on('connect', () => { clearTimeout(timer); try { sock.destroy(); } catch (e) { /* ignore */ } proxyReachable = true; resolve(true); });
-      sock.on('error', () => { clearTimeout(timer); proxyReachable = false; resolve(false); });
-    } catch (e) { proxyReachable = false; resolve(false); }
-  });
+async function checkProxyReachability() {
+  const proxies = proxyList();
+  if (!proxies.length) { proxyReachable = false; return false; }
+  // Real test: fetch a tiny URL through the first proxy. If the proxy
+  // cannot carry an HTTPS request, yt-dlp cannot use it either.
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5000);
+    const res = await ufetch('https://clients3.google.com/generate_204', {
+      dispatcher: new ProxyAgent(proxies[0]),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    proxyReachable = res.status === 204 || res.status === 200;
+    return proxyReachable;
+  } catch (e) {
+    proxyReachable = false;
+    return false;
+  }
 }
 function proxyArgs() {
   // Proxy pool (IP rotation): YTDLP_PROXY = one proxy URL or a
@@ -739,13 +744,32 @@ app.get('/api/stream', async (req, res) => {
     if (match) dispatcher = new ProxyAgent(match);
   }
 
+  // Fetch the file. If the proxy fetch fails (proxy unreachable from this
+  // host), retry DIRECT — the URL may have been issued for this server's
+  // own IP, or carry ipbypass=yes. Without this fallback a dead proxy
+  // turns every download into "open in a new tab".
+  const fetchOnce = (disp) => ufetch(target, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
+    redirect: 'follow',
+    ...(disp ? { dispatcher: disp } : {}),
+  });
+  let upstream = null;
   try {
-    const upstream = await ufetch(target, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' },
-      redirect: 'follow',
-      ...(dispatcher ? { dispatcher } : {}),
-    });
-    if (!upstream.ok || !upstream.body) return jsonErr(502, 'Could not fetch the file.');
+    upstream = await fetchOnce(dispatcher);
+    if (!upstream.ok || !upstream.body) throw new Error('bad upstream');
+  } catch (e) {
+    upstream = null;
+  }
+  if (!upstream && dispatcher) {
+    try {
+      upstream = await fetchOnce(null);
+      if (!upstream.ok || !upstream.body) upstream = null;
+    } catch (e) {
+      upstream = null;
+    }
+  }
+  try {
+    if (!upstream) return jsonErr(502, 'Could not fetch the file.');
     res.set('Content-Type', upstream.headers.get('content-type') || 'video/mp4');
     res.set('Content-Disposition', 'attachment; filename="' + filename + '"');
     // CORS: the frontend runs on Cloudflare Pages while this API runs
