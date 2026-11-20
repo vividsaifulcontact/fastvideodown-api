@@ -210,7 +210,41 @@ function proxyArgs() {
   return proxies.length ? ['--proxy', proxies[Math.floor(Math.random() * proxies.length)]] : [];
 }
 
-// ---------- download helpers (from download function) ----------
+// Run several yt-dlp attempts IN PARALLEL and return the first one that
+// yields usable formats. On a tiny server the attempts are mostly waiting
+// on the network (I/O-bound), so running two at once is faster than
+// running them one after another — the total is the fastest attempt, not
+// the sum. The losers are left to finish on their own (their temp dirs
+// are cleaned up by runYtDlp itself); we just stop waiting for them.
+async function raceYtDlp(attempts) {
+  const jobs = attempts.map(async ({ a, t }) => {
+    const { stdout, stderr } = await runYtDlp(a, t);
+    let data = null;
+    if (stdout) { try { data = JSON.parse(stdout); } catch (e) { data = null; } }
+    if (data) {
+      const f = buildFormats(data.formats);
+      if (f.video.length || f.audio.length) return { data, stderr };
+    }
+    return { data: null, stderr };
+  });
+  // Promise.race on the first job that RESOLVES with data; a job that
+  // resolves without data does not win the race, so wrap each job to only
+  // resolve when it has data and never otherwise (the outer timeout below
+  // bounds the whole race).
+  const winners = jobs.map((p) => p.then((r) => (r.data ? Promise.resolve(r) : new Promise(() => {}))));
+  const timeoutMs = Math.max(...attempts.map((x) => x.t || 10000));
+  const timeout = new Promise((resolve) => setTimeout(() => resolve({ data: null, stderr: '' }), timeoutMs + 2000));
+  const winner = await Promise.race([...winners, timeout]);
+  // Collect the last error from any finished job for the error message.
+  let lastErr = winner && winner.stderr ? winner.stderr : '';
+  if (!winner || !winner.data) {
+    const settled = await Promise.allSettled(jobs.map((p) => Promise.race([p, new Promise((r) => setTimeout(() => r({ data: null, stderr: '' }), 100)) ])));
+    for (const s of settled) {
+      if (s.status === 'fulfilled' && s.value && s.value.stderr) lastErr = s.value.stderr;
+    }
+  }
+  return { data: winner && winner.data ? winner.data : null, lastErr };
+}
 
 function safeName(title, ext) {
   const base = (title || 'video').replace(/[^\w\s\-\u0980-\u09FF.]/g, '').trim().slice(0, 80) || 'video';
@@ -334,7 +368,7 @@ app.post('/api/formats', async (req, res) => {
   // X/Twitter — without it X can never work — and the web client for
   // everything else.)
   const attempts = !proxyReachable
-    ? [{ a: androidArgs, t: 15000 }, mid, { a: androidNoCertArgs, t: 5000 }]
+    ? [{ a: androidArgs, t: 10000 }, mid, { a: androidNoCertArgs, t: 5000 }]
     : deep
       ? (isYT
         ? [{ a: webArgs, t: 9000 }, { a: tvArgs, t: 6000 }, { a: androidArgs, t: 5000 }, { a: androidNoCertArgs, t: 5000 }]
@@ -345,6 +379,30 @@ app.post('/api/formats', async (req, res) => {
   let bestData = null;
   let bestCount = 0;
   let lastErr = '';
+  // SPEED: when the proxy is unreachable (e.g. Cloady) the lookup is
+  // direct and the first usable result wins — run android + mid IN
+  // PARALLEL and take whichever answers first, instead of waiting for
+  // android's full timeout before even starting mid. This cuts the
+  // typical lookup from ~35s to the fastest single attempt.
+  if (!proxyReachable) {
+    const { a: firstA, t: firstT } = attempts[0];
+    const midAttempt = attempts[1];
+    const raced = await raceYtDlp([
+      { a: firstA, t: firstT },
+      { a: midAttempt.a, t: midAttempt.t },
+    ]);
+    data = raced.data;
+    lastErr = raced.lastErr || '';
+    if (!data) {
+      const { stdout, stderr } = await runYtDlp(attempts[2].a, attempts[2].t);
+      lastErr = stderr || lastErr;
+      if (stdout) { try { data = JSON.parse(stdout); } catch (e) { data = null; } }
+      if (data) {
+        const f = buildFormats(data.formats);
+        if (!f.video.length && !f.audio.length) data = null;
+      }
+    }
+  } else {
   for (const { a, t } of attempts) {
     const { stdout, stderr } = await runYtDlp(a, t);
     lastErr = stderr || '';
@@ -376,6 +434,7 @@ app.post('/api/formats', async (req, res) => {
       }
       data = null;
     }
+  }
   }
   if (!data) data = bestData;
 
