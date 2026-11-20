@@ -328,17 +328,30 @@ app.post('/api/formats', async (req, res) => {
   // On some hosts (e.g. Cloady) the proxy itself is unreachable, so ALL
   // proxied attempts fail even though the server's own network works fine
   // (the thumbnail stream, which fetches directly, proves it). If nothing
-  // came back, try once more with NO proxy, straight from the server IP.
-  // A datacenter IP may only return 360p on YouTube, but a working 360p
-  // beats a total failure.
+  // came back, run the full chain again with NO proxy, straight from the
+  // server IP — web first (it lists the high qualities + real audio),
+  // then android. A datacenter IP may still be limited on YouTube, but a
+  // working 720p/1080p beats a total failure.
   if (!data) {
-    const directArgs = ['-J', '--no-playlist', '--skip-download', '--no-warnings',
+    const directBase = ['-J', '--no-playlist', '--skip-download', '--no-warnings',
       '--socket-timeout', '8', '--retries', '1',
-      '--extractor-args', 'youtube:player_client=android', url];
-    const { stdout, stderr } = await runYtDlp(directArgs, 9000);
-    lastErr = stderr || '';
-    if (stdout) {
-      try { data = JSON.parse(stdout); } catch (e) { data = null; }
+      '--js-runtimes', 'node', '--remote-components', 'ejs:github'];
+    const directAttempts = [
+      { a: [...directBase, '--extractor-args', 'youtube:player_client=web,android', url], t: 12000 },
+      { a: [...directBase, '--extractor-args', 'youtube:player_client=tv', url], t: 8000 },
+      { a: [...directBase, '--extractor-args', 'youtube:player_client=android', url], t: 8000 },
+    ];
+    for (const { a, t } of directAttempts) {
+      const { stdout, stderr } = await runYtDlp(a, t);
+      lastErr = stderr || '';
+      if (stdout) {
+        try { data = JSON.parse(stdout); } catch (e) { data = null; }
+      }
+      if (data) {
+        const f = buildFormats(data.formats);
+        if (f.video.length || f.audio.length) break;
+        data = null;
+      }
     }
   }
 
@@ -434,16 +447,23 @@ app.post('/api/download', async (req, res) => {
   }
   if (!/^https?:\/\//.test(direct)) {
     // DIRECT FALLBACK (same reason as /api/formats): if the Webshare proxy
-    // is unreachable from this host, every proxied attempt fails. Try once
-    // with NO proxy, straight from the server IP.
-    const directAttempt = ['-g', '-f', formatId, '--no-playlist', '--no-warnings',
-      '--socket-timeout', '8', '--retries', '1',
-      '--extractor-args', 'youtube:player_client=android', url];
-    const r = await runYtDlp(directAttempt, 9000);
-    stderr = r.stderr || stderr;
-    const cand = (r.stdout || '').trim().split('\n')[0] || '';
-    if (/^https?:\/\//.test(cand) && !(isAudio && /[?&]mime=video%2F/i.test(cand))) {
-      direct = cand;
+    // is unreachable from this host, every proxied attempt fails. Try the
+    // chain again with NO proxy, straight from the server IP — web first
+    // (it lists real audio-only streams), then android.
+    const mkDirect = (extra) => ['-g', '-f', formatId, '--no-playlist', '--no-warnings',
+      '--socket-timeout', '8', '--retries', '1', ...extra, url];
+    const directAttempts = [
+      { a: mkDirect(['--js-runtimes', 'node', '--remote-components', 'ejs:github', '--extractor-args', 'youtube:player_client=web,android']), t: 12000 },
+      { a: mkDirect(['--extractor-args', 'youtube:player_client=android']), t: 8000 },
+    ];
+    for (const { a, t } of directAttempts) {
+      const r = await runYtDlp(a, t);
+      stderr = r.stderr || stderr;
+      const cand = (r.stdout || '').trim().split('\n')[0] || '';
+      if (/^https?:\/\//.test(cand) && !(isAudio && /[?&]mime=video%2F/i.test(cand))) {
+        direct = cand;
+        break;
+      }
     }
   }
   if (!/^https?:\/\//.test(direct)) {
