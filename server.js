@@ -324,10 +324,15 @@ app.post('/api/formats', async (req, res) => {
   // When the proxy is unreachable, a direct datacenter IP can only ever
   // return the low formats (360p) — web/tv add nothing but 20s+ of CPU on
   // a tiny server, and on an overloaded host even the android attempt can
-  // exceed its short timeout and cascade into more attempts. So go
-  // android-only with a generous timeout: one yt-dlp run, fastest result.
+  // exceed its short timeout and cascade into more attempts. So android
+  // goes first with a generous timeout and returns immediately when it
+  // yields usable formats. BUT android must not be the ONLY attempt: if
+  // it is bot-checked or fails, there is no fallback and the lookup fails
+  // outright. Keep web + no-cert behind it as fallbacks — they only run
+  // when android fails, so the fast path stays fast and a blocked android
+  // does not mean a failed lookup.
   const attempts = !proxyReachable
-    ? [{ a: androidArgs, t: 15000 }]
+    ? [{ a: androidArgs, t: 15000 }, { a: webArgs, t: 12000 }, { a: androidNoCertArgs, t: 5000 }]
     : deep
       ? (isYT
         ? [{ a: webArgs, t: 9000 }, { a: tvArgs, t: 6000 }, { a: androidArgs, t: 5000 }, { a: androidNoCertArgs, t: 5000 }]
@@ -456,20 +461,25 @@ async function extractAudio(url, title) {
   try { fs.mkdirSync(tmpDir, { recursive: true }); } catch (e) { /* ignore */ }
   const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* ignore */ } };
   const pArgs = proxyArgs();
+  // Audio extraction must be FAST: use the android client only (no EJS
+  // solver — the web client + EJS is what made this hang for minutes on
+  // the tiny server) and tight timeouts, so a stuck download returns an
+  // error instead of holding the request open. -f 18 is the 360p
+  // with-sound file that a direct IP can actually fetch; it is small and
+  // carries the audio track we need.
   const dlArgs = [
-    '-f', 'best',
+    '-f', '18/best[height<=360]/best',
     '--no-playlist', '--no-warnings',
     '--socket-timeout', '10', '--retries', '1',
-    '--js-runtimes', 'node', '--remote-components', 'ejs:github',
-    '--extractor-args', 'youtube:player_client=web,android',
+    '--extractor-args', 'youtube:player_client=android',
     '-o', tmpDir + '/video.%(ext)s',
     ...pArgs, url,
   ];
   const envExtra = { TMPDIR: tmpDir, PATH: path.join(__dirname, 'bin') + ':' + (process.env.PATH || '') };
-  let dl = await runCmd(src, dlArgs, 300000, envExtra);
+  let dl = await runCmd(src, dlArgs, 60000, envExtra);
   if (dl.err && pArgs.length) {
     const noProxy = dlArgs.filter(a => !pArgs.includes(a));
-    dl = await runCmd(src, noProxy, 300000, envExtra);
+    dl = await runCmd(src, noProxy, 60000, envExtra);
   }
   if (dl.err) { cleanup(); return null; }
   let video = null;
@@ -481,10 +491,10 @@ async function extractAudio(url, title) {
   const ffmpeg = findFfmpeg();
   const out = path.join(tmpDir, 'audio.m4a');
   // 1) copy the AAC track untouched (fast, original quality).
-  let conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'copy', '-y', out], 180000, envExtra);
+  let conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'copy', '-y', out], 60000, envExtra);
   // 2) if the track is not AAC, re-encode it to AAC.
   if (conv.err) {
-    conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'aac', '-b:a', '192k', '-y', out], 180000, envExtra);
+    conv = await runCmd(ffmpeg, ['-i', video, '-vn', '-c:a', 'aac', '-b:a', '192k', '-y', out], 60000, envExtra);
   }
   if (conv.err) { cleanup(); return null; }
   try { if (!fs.existsSync(out) || fs.statSync(out).size < 1000) { cleanup(); return null; } } catch (e) { cleanup(); return null; }
