@@ -403,6 +403,55 @@ app.get('/api/cobalt-test', async (req, res) => {
   res.json({ ok: true, url, results });
 });
 
+// ---------- GET /api/dlsrv-test ----------
+// Test headless-browser automation of the dlsrv.online widget (used by
+// ssyoutube.me). Launches Chromium, opens the embed, waits for the Cap
+// check to solve and the session token to appear, then calls the download
+// API with that token. Returns the download links or the failure reason.
+//   GET /api/dlsrv-test?url=<youtube url>&quality=1080
+app.get('/api/dlsrv-test', async (req, res) => {
+  const url = (req.query.url || 'https://youtu.be/aLd66fzW6sE').trim();
+  const quality = (req.query.quality || '1080').trim();
+  const m = url.match(/(?:youtu\.be\/|v=|shorts\/)([\w-]{11})/);
+  if (!m) return res.status(400).json({ ok: false, error: 'Not a YouTube URL' });
+  const videoId = m[1];
+  const t0 = Date.now();
+  let browser = null;
+  try {
+    const { chromium } = require('playwright');
+    browser = await chromium.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+    const page = await browser.newPage();
+    await page.goto(`https://embed.dlsrv.online/v1/full?videoId=${videoId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // Wait for the Cap check to solve and the session token to be stored.
+    let token = null;
+    for (let i = 0; i < 30; i++) {
+      token = await page.evaluate(() => sessionStorage.getItem('__session')).catch(() => null);
+      if (token) break;
+      await page.waitForTimeout(2000);
+    }
+    const ms = Date.now() - t0;
+    if (!token) {
+      await browser.close();
+      return res.json({ ok: false, videoId, ms, error: 'No session token after 60s — Cap check did not solve (blocked or headless detected).' });
+    }
+    // Call the download API with the session token.
+    const dl = await fetch('https://embed.dlsrv.online/api/v3/download', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoId, format: 'mp4', quality }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const dlText = await dl.text();
+    await browser.close();
+    return res.json({ ok: dl.ok, videoId, ms, tokenLen: token.length, http: dl.status, download: dlText.slice(0, 600) });
+  } catch (e) {
+    if (browser) { try { await browser.close(); } catch (_) {} }
+    return res.json({ ok: false, videoId, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 300) });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'fastvideodown-api' });
 });
