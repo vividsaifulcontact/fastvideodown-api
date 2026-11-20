@@ -360,6 +360,49 @@ app.get('/api/proxy-test', async (req, res) => {
   });
 });
 
+// ---------- GET /api/cobalt-test ----------
+// Test the Cobalt public API from THIS server (not the sandbox).
+// Cobalt is a legitimate open API for video downloads (YouTube, TikTok,
+// Instagram, X, etc.). Tries several public instances in order.
+//   GET /api/cobalt-test?url=<video url>
+app.get('/api/cobalt-test', async (req, res) => {
+  const url = (req.query.url || 'https://youtu.be/aLd66fzW6sE').trim();
+  if (!/^https?:\/\/.+/i.test(url)) {
+    return res.status(400).json({ ok: false, error: 'Missing url' });
+  }
+  const instances = [
+    'https://co.wuk.sh',
+    'https://dwnld.nichind.dev',
+    'https://cobalt.api.timelessnesses.me',
+  ];
+  const results = [];
+  for (const base of instances) {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(base, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ url, videoQuality: '720', audioFormat: 'mp3' }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const ms = Date.now() - t0;
+      const body = await r.text();
+      let j = null;
+      try { j = JSON.parse(body); } catch (e) { j = null; }
+      results.push({
+        instance: base, http: r.status, ms,
+        status: j?.status || null,
+        url: j?.url ? j.url.slice(0, 80) : null,
+        error: j?.error ? JSON.stringify(j.error).slice(0, 150) : (j ? null : body.slice(0, 150)),
+      });
+      if (j && (j.status === 'redirect' || j.status === 'tunnel' || j.status === 'stream' || j.status === 'success')) break;
+    } catch (e) {
+      results.push({ instance: base, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 150) });
+    }
+  }
+  res.json({ ok: true, url, results });
+});
+
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'fastvideodown-api' });
 });
