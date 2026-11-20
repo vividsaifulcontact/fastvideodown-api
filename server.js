@@ -321,11 +321,18 @@ app.post('/api/formats', async (req, res) => {
   // web client withholds — then the reliable android fallback, then no-cert.
   const tvArgs = [...baseArgs, '--extractor-args', 'youtube:player_client=tv', ...pArgs, url];
   const mid = isX ? { a: syndicationArgs, t: 9000 } : { a: webArgs, t: 12000 };
-  const attempts = deep
-    ? (isYT
-      ? [{ a: webArgs, t: 9000 }, { a: tvArgs, t: 6000 }, { a: androidArgs, t: 5000 }, { a: androidNoCertArgs, t: 5000 }]
-      : [mid, { a: androidArgs, t: 8000 }, { a: androidNoCertArgs, t: 5000 }])
-    : [{ a: androidArgs, t: 8000 }, mid, { a: androidNoCertArgs, t: 5000 }];
+  // When the proxy is unreachable, a direct datacenter IP can only ever
+  // return the low formats (360p) — web/tv add nothing but 20s+ of CPU on
+  // a tiny server, and on an overloaded host even the android attempt can
+  // exceed its short timeout and cascade into more attempts. So go
+  // android-only with a generous timeout: one yt-dlp run, fastest result.
+  const attempts = !proxyReachable
+    ? [{ a: androidArgs, t: 15000 }]
+    : deep
+      ? (isYT
+        ? [{ a: webArgs, t: 9000 }, { a: tvArgs, t: 6000 }, { a: androidArgs, t: 5000 }, { a: androidNoCertArgs, t: 5000 }]
+        : [mid, { a: androidArgs, t: 8000 }, { a: androidNoCertArgs, t: 5000 }])
+      : [{ a: androidArgs, t: 8000 }, mid, { a: androidNoCertArgs, t: 5000 }];
 
   let data = null;
   let bestData = null;
@@ -373,7 +380,10 @@ app.post('/api/formats', async (req, res) => {
   // server IP — web first (it lists the high qualities + real audio),
   // then android. A datacenter IP may still be limited on YouTube, but a
   // working 720p/1080p beats a total failure.
-  if (!data) {
+  // (Skipped when the proxy is already known unreachable: the attempts
+  // above were direct already, so retrying them direct would just burn
+  // another ~30s for the same result.)
+  if (!data && proxyReachable) {
     const directBase = ['-J', '--no-playlist', '--skip-download', '--no-warnings',
       '--socket-timeout', '8', '--retries', '1',
       '--js-runtimes', 'node', '--remote-components', 'ejs:github'];
