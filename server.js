@@ -128,6 +128,36 @@ function pickThumbnail(thumbnails) {
   return sorted[0] && sorted[0].url ? sorted[0].url : null;
 }
 
+// Server-side allowlisting (defense-in-depth, 2026-11-21): the frontend
+// escapes these values, but a hostile extractor/fallback must never be able
+// to smuggle a quote, backslash, or javascript: URL through the API in the
+// first place. A malicious format_id/ext/fps/url used to reach the page's
+// inline onclick handlers (stored XSS) — the frontend now escapes them, and
+// this stops the hostile values at the source.
+const SAFE_EXT = new Set(['mp4', 'webm', 'mkv', 'mov', 'avi', 'flv', 'm4v', '3gp', 'mp3', 'm4a', 'aac', 'opus', 'ogg', 'oga', 'wav', 'flac', 'jpg', 'jpeg', 'png', 'webp', 'gif']);
+function safeFormatId(v) {
+  // yt-dlp ids look like 137, 22, hls-1080, 137+140, sb0 — keep letters,
+  // digits and . _ - + / only; strips quotes, backslashes, brackets, etc.
+  return String(v || '').replace(/[^A-Za-z0-9._+\/-]/g, '').slice(0, 64) || 'unknown';
+}
+function safeExt(v, fallback) {
+  const e = String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return SAFE_EXT.has(e) ? e : fallback;
+}
+function safeFps(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+function safeUrl(v) {
+  const u = String(v || '').trim();
+  if (!/^https?:\/\//i.test(u)) return null;
+  // A legitimate media URL never contains a raw quote, angle bracket,
+  // backslash or whitespace (those are percent-encoded) — reject them so a
+  // hostile URL cannot smuggle characters into the frontend's onclick/attrs.
+  if (/['"<>\\ \t\r\n]/.test(u)) return null;
+  return u;
+}
+
 function buildFormats(list) {
   const videoByHeight = new Map();
   const audioByKey = new Map();
@@ -135,6 +165,10 @@ function buildFormats(list) {
     if (!f || !f.url || f.ext === 'mhtml') continue;
     const proto = (f.protocol || '').toLowerCase();
     if (proto && !proto.startsWith('http')) continue;
+    // The URL scheme itself must be http(s) — a format with no protocol
+    // field but a javascript:/data: URL must not reach the frontend.
+    const url = safeUrl(f.url);
+    if (!url) continue;
     // Some extractors (e.g. X/Twitter syndication) omit codec fields: a format
     // with a height but no codec info is a combined video+audio file.
     const hasVideo = (f.vcodec && f.vcodec !== 'none') || !!f.height;
@@ -144,17 +178,17 @@ function buildFormats(list) {
       if (!h) continue;
       const key = String(h);
       const item = {
-        format_id: String(f.format_id),
+        format_id: safeFormatId(f.format_id),
         label: h + 'p',
         height: h,
-        ext: f.ext || 'mp4',
+        ext: safeExt(f.ext, 'mp4'),
         hasAudio: !!hasAudio,
-        fps: f.fps || null,
+        fps: safeFps(f.fps),
         filesize: f.filesize || f.filesize_approx || null,
-        vcodec: f.vcodec,
+        vcodec: String(f.vcodec || '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 32) || undefined,
         // Direct link, already fetched: the Download button opens it instantly
         // instead of running a second yt-dlp lookup.
-        url: f.url || null,
+        url,
       };
       const prev = videoByHeight.get(key);
       if (!prev || (!prev.hasAudio && item.hasAudio) ||
@@ -162,15 +196,16 @@ function buildFormats(list) {
         videoByHeight.set(key, item);
       }
     } else if (hasAudio) {
-      const key = (f.ext || 'audio') + '|' + (f.abr || 0);
+      const ext = safeExt(f.ext, 'm4a');
+      const key = ext + '|' + (f.abr || 0);
       const item = {
-        format_id: String(f.format_id),
-        label: (f.abr ? Math.round(f.abr) + ' kbps' : (f.ext || 'audio')).toUpperCase(),
-        ext: f.ext || 'm4a',
+        format_id: safeFormatId(f.format_id),
+        label: (f.abr ? Math.round(f.abr) + ' kbps' : ext).toUpperCase(),
+        ext,
         abr: f.abr || null,
         filesize: f.filesize || f.filesize_approx || null,
         // Direct link, already fetched: the Download button opens it instantly.
-        url: f.url || null,
+        url,
       };
       const prev = audioByKey.get(key);
       if (!prev || (item.filesize || 0) > (prev.filesize || 0)) audioByKey.set(key, item);
@@ -344,11 +379,11 @@ function fetchJson(url, headers, timeoutMs) {
 }
 function normVideo(url, label, height, ext) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
-  return { format_id: 'fb-' + (label || 'video').replace(/[^a-z0-9]/gi, '').toLowerCase(), label: label || 'Video', height: height || 0, ext: ext || 'mp4', url, filesize: null, hasAudio: true };
+  return { format_id: 'fb-' + (label || 'video').replace(/[^a-z0-9]/gi, '').toLowerCase(), label: label || 'Video', height: height || 0, ext: safeExt(ext, 'mp4'), url, filesize: null, hasAudio: true };
 }
 function normAudio(url, label, ext) {
   if (!url || !/^https?:\/\//i.test(url)) return null;
-  return { format_id: 'fb-audio', label: label || 'Audio only', ext: ext || 'm4a', url, filesize: null, abr: 128 };
+  return { format_id: 'fb-audio', label: label || 'Audio only', ext: safeExt(ext, 'm4a'), url, filesize: null, abr: 128 };
 }
 // SaveAPI (saveapi.org) — free tier 1,000 credits, no card, no expiry.
 // GET /v1/download?url=... with Authorization: Bearer <key>.
