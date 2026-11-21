@@ -92,6 +92,7 @@ function platformName(url) {
   if (/reddit\.com/.test(u)) return 'Reddit';
   if (/vimeo\.com/.test(u)) return 'Vimeo';
   if (/dailymotion\.com/.test(u)) return 'Dailymotion';
+  if (/twitch\.tv|clips\.twitch\.tv/.test(u)) return 'Twitch';
   return 'This platform';
 }
 
