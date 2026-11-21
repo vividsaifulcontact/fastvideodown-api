@@ -427,15 +427,80 @@ async function tikwmFallback(url) {
   if (!video.length && !audio.length) return null;
   return { title: d.title || 'Video', thumbnail: d.cover || d.origin_cover || null, video, audio, source: 'tikwm' };
 }
+// scrapr (@coflyn/scrapr, MIT) — open-source extractor library. Its
+// lightweight methods (axios + cheerio, no browser) scrape the downloader
+// sites the user named (snaptik.app, ssstik.io, tikdownloader.io) plus
+// tiktokio, savetik, indown, snapsave. Browser-requiring methods
+// (savetik, fdown, snapinsta) are NOT used — no browser on Cloady free.
+let scrapr = null;
+try { scrapr = require('@coflyn/scrapr'); } catch (e) { scrapr = null; }
+function scraprResult(res, source) {
+  if (!res || !res.status || !res.result) return null;
+  const r = res.result;
+  const video = [];
+  const audio = [];
+  for (const d of (r.downloads || [])) {
+    const u = d.url;
+    if (!u || !/^https?:\/\//i.test(u)) continue;
+    const type = (d.type || '').toLowerCase();
+    if (type.includes('audio') || type.includes('mp3') || /\.mp3(\?|$)/i.test(u)) {
+      const a = normAudio(u, d.quality || 'Audio only', 'mp3');
+      if (a) audio.push(a);
+    } else {
+      const h = parseInt((d.quality || '').replace(/[^0-9]/g, ''), 10) || 0;
+      const v = normVideo(u, d.quality || 'Video', h, 'mp4');
+      if (v) video.push(v);
+    }
+  }
+  if (!video.length && !audio.length) return null;
+  return { title: r.title || 'Video', thumbnail: r.thumbnail || null, video, audio, source };
+}
+async function scraprFallback(url, method, source) {
+  if (!scrapr) return null;
+  try {
+    const res = await method(url);
+    return scraprResult(res, source);
+  } catch (e) { return null; }
+}
 // Try the free fallbacks in platform order; first success wins.
 async function tryFallbacks(url) {
   const p = platformName(url);
   const chain = [];
-  chain.push({ name: 'saveapi', fn: saveApiFallback });
-  if (p === 'TikTok') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); chain.push({ name: 'tikwm', fn: tikwmFallback }); }
-  else if (p === 'Facebook' || p === 'X') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); if (p === 'X') chain.push({ name: 'fxtwitter', fn: fxTwitterFallback }); }
-  else if (p !== 'Instagram' && p !== 'YouTube') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); }
-  // Instagram: SaveAPI only. YouTube: dlsrv automation (VPS) — no free API fallback.
+  if (p === 'TikTok') {
+    // scrapr first (fast, purpose-built), then the API sources.
+    if (scrapr) {
+      chain.push({ name: 'snaptik', fn: (u) => scraprFallback(u, scrapr.tiktok.snaptik, 'snaptik') });
+      chain.push({ name: 'ssstik', fn: (u) => scraprFallback(u, scrapr.tiktok.ssstik, 'ssstik') });
+      chain.push({ name: 'tikdownloader', fn: (u) => scraprFallback(u, scrapr.tiktok.tikdownloader, 'tikdownloader') });
+      chain.push({ name: 'tiktokio', fn: (u) => scraprFallback(u, scrapr.tiktok.tiktokio, 'tiktokio') });
+    }
+    chain.push({ name: 'saveapi', fn: saveApiFallback });
+    chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback });
+    chain.push({ name: 'tikwm', fn: tikwmFallback });
+  } else if (p === 'Instagram') {
+    chain.push({ name: 'saveapi', fn: saveApiFallback });
+    if (scrapr) {
+      chain.push({ name: 'ig-direct', fn: (u) => scraprFallback(u, scrapr.instagram.direct, 'ig-direct') });
+      chain.push({ name: 'indown', fn: (u) => scraprFallback(u, scrapr.instagram.indown, 'indown') });
+      chain.push({ name: 'ig-snapsave', fn: (u) => scraprFallback(u, scrapr.instagram.snapsave, 'ig-snapsave') });
+    }
+  } else if (p === 'Facebook') {
+    chain.push({ name: 'saveapi', fn: saveApiFallback });
+    chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback });
+    if (scrapr) chain.push({ name: 'fb-snapsave', fn: (u) => scraprFallback(u, scrapr.facebook.snapsave, 'fb-snapsave') });
+  } else if (p === 'X') {
+    chain.push({ name: 'saveapi', fn: saveApiFallback });
+    chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback });
+    chain.push({ name: 'fxtwitter', fn: fxTwitterFallback });
+    if (scrapr) {
+      chain.push({ name: 'tweeload', fn: (u) => scraprFallback(u, scrapr.twitter.tweeload, 'tweeload') });
+      chain.push({ name: 'tvd', fn: (u) => scraprFallback(u, scrapr.twitter.tvd, 'tvd') });
+    }
+  } else {
+    chain.push({ name: 'saveapi', fn: saveApiFallback });
+    chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback });
+  }
+  // YouTube: dlsrv automation (VPS) — no free API fallback.
   const tried = [];
   for (const { name, fn } of chain) {
     try {
@@ -609,6 +674,15 @@ app.get('/api/fallback-test', async (req, res) => {
     ['fxtwitter', fxTwitterFallback],
     ['tikwm', tikwmFallback],
   ];
+  if (scrapr) {
+    tests.push(['snaptik', (u) => scraprFallback(u, scrapr.tiktok.snaptik, 'snaptik')]);
+    tests.push(['ssstik', (u) => scraprFallback(u, scrapr.tiktok.ssstik, 'ssstik')]);
+    tests.push(['tikdownloader', (u) => scraprFallback(u, scrapr.tiktok.tikdownloader, 'tikdownloader')]);
+    tests.push(['tiktokio', (u) => scraprFallback(u, scrapr.tiktok.tiktokio, 'tiktokio')]);
+    tests.push(['ig-direct', (u) => scraprFallback(u, scrapr.instagram.direct, 'ig-direct')]);
+    tests.push(['indown', (u) => scraprFallback(u, scrapr.instagram.indown, 'indown')]);
+    tests.push(['ig-snapsave', (u) => scraprFallback(u, scrapr.instagram.snapsave, 'ig-snapsave')]);
+  }
   for (const [name, fn] of tests) {
     const s = Date.now();
     try {
