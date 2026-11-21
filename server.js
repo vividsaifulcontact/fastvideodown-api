@@ -618,7 +618,19 @@ app.get('/api/fallback-test', async (req, res) => {
         : { ok: false, ms: Date.now() - s, reason: 'no result' };
     } catch (e) { results[name] = { ok: false, ms: Date.now() - s, reason: String(e && e.message || e).slice(0, 120) }; }
   }
-  res.json({ ok: true, url, platform: platformName(url), ms: Date.now() - t0, saveapi_key_set: !!(process.env.SAVEAPI_KEY || '').trim(), results });
+  // Raw diagnostics: call the two key APIs directly and show the first
+  // 300 chars of their raw response, so a parser mismatch is visible.
+  const diag = {};
+  try {
+    const key = (process.env.SAVEAPI_KEY || '').trim();
+    if (key) {
+      const r = await fetchJson('https://api.saveapi.org/v1/download?url=' + encodeURIComponent(url), { Authorization: 'Bearer ' + key }, 25000);
+      diag.saveapi_raw = { status: r.status, body: (r.text || '').slice(0, 300) };
+    }
+    const r2 = await fetchJson('https://www.tikwm.com/api/?url=' + encodeURIComponent(url), {}, 20000);
+    diag.tikwm_raw = { status: r2.status, body: (r2.text || '').slice(0, 300) };
+  } catch (e) { diag.error = String(e && e.message || e).slice(0, 100); }
+  res.json({ ok: true, url, platform: platformName(url), ms: Date.now() - t0, saveapi_key_set: !!(process.env.SAVEAPI_KEY || '').trim(), results, diag });
 });
 
 app.get('/', (req, res) => {
