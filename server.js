@@ -314,6 +314,139 @@ function fetchSmall(startUrl, timeoutMs) {
   });
 }
 
+// ---------- Third-party fallback sources ----------
+// When yt-dlp is blocked (datacenter IP), try free third-party APIs in
+// order. NO paid links — only free tiers / free no-key APIs. Free tiers
+// (SaveAPI 1,000 credits) are never topped up with money.
+// Order per platform:
+//   TikTok:    SaveAPI -> SaveReelsFast -> tikwm
+//   Instagram: SaveAPI only (no free no-key API exists)
+//   Facebook:  SaveAPI -> SaveReelsFast
+//   X:         SaveAPI -> SaveReelsFast -> FxTwitter
+//   Others:    SaveAPI -> SaveReelsFast
+// Each helper returns { title, thumbnail, video: [...], audio: [...] }
+// in the same shape as buildFormats(), or null on failure.
+function fetchJson(url, headers, timeoutMs) {
+  return new Promise((resolve) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    ufetch(url, { headers: headers || {}, signal: ctrl.signal })
+      .then(async (r) => {
+        clearTimeout(timer);
+        const text = await r.text().catch(() => '');
+        let json = null;
+        try { json = JSON.parse(text); } catch (e) { json = null; }
+        resolve({ status: r.status, json, text: text.slice(0, 500) });
+      })
+      .catch(() => { clearTimeout(timer); resolve({ status: 0, json: null, text: '' }); });
+  });
+}
+function normVideo(url, label, height, ext) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  return { format_id: 'fb-' + (label || 'video').replace(/[^a-z0-9]/gi, '').toLowerCase(), label: label || 'Video', height: height || 0, ext: ext || 'mp4', url, filesize: null, hasAudio: true };
+}
+function normAudio(url, label, ext) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  return { format_id: 'fb-audio', label: label || 'Audio only', ext: ext || 'm4a', url, filesize: null, abr: 128 };
+}
+// SaveAPI (saveapi.org) — free tier 1,000 credits, no card, no expiry.
+// GET /v1/download?url=... with Authorization: Bearer <key>.
+// 14 platforms: Instagram, TikTok, YouTube, Facebook, X, Pinterest, etc.
+async function saveApiFallback(url) {
+  const key = (process.env.SAVEAPI_KEY || '').trim();
+  if (!key) return null;
+  const r = await fetchJson('https://api.saveapi.org/v1/download?url=' + encodeURIComponent(url), { Authorization: 'Bearer ' + key }, 25000);
+  if (!r.json) return null;
+  const d = r.json.data || r.json;
+  const video = [];
+  const audio = [];
+  // Flexible parse: media[] with url/type, or direct download_url/video/audio fields.
+  const media = Array.isArray(d.media) ? d.media : (Array.isArray(d.medias) ? d.medias : []);
+  for (const m of media) {
+    const u = m.url || m.download_url || m.link;
+    const kind = (m.type || m.kind || m.media_type || '').toLowerCase();
+    if (!u) continue;
+    if (kind.includes('audio') || /\.mp3(\?|$)/i.test(u)) { const a = normAudio(u, 'Audio only', 'mp3'); if (a) audio.push(a); }
+    else { const v = normVideo(u, m.quality || m.label || 'Video', m.height || 0, 'mp4'); if (v) video.push(v); }
+  }
+  const direct = d.download_url || d.video_url || d.url;
+  if (!video.length && direct) { const v = normVideo(direct, 'Video', d.height || 0, 'mp4'); if (v) video.push(v); }
+  const aUrl = d.audio_url || d.audio;
+  if (!audio.length && aUrl) { const a = normAudio(typeof aUrl === 'string' ? aUrl : aUrl.url, 'Audio only', 'm4a'); if (a) audio.push(a); }
+  if (!video.length && !audio.length) return null;
+  return { title: d.title || d.caption || 'Video', thumbnail: d.thumbnail || d.cover || d.image || null, video, audio, source: 'saveapi' };
+}
+// SaveReelsFast public API — no key, no account. TikTok, Facebook, X,
+// Reddit, Threads, Pinterest, Snapchat, LinkedIn. NO Instagram/YouTube.
+// GET /api/public/extract?url=... — 50/day per IP, 20/min.
+async function saveReelsFastFallback(url) {
+  const r = await fetchJson('https://www.savereelsfast.com/api/public/extract?url=' + encodeURIComponent(url), {}, 25000);
+  if (!r.json) return null;
+  const d = r.json.data || r.json;
+  if (r.json.success === false || r.json.error) return null;
+  const video = [];
+  const audio = [];
+  const vUrl = d.video || d.video_url || d.download_url || (Array.isArray(d.videos) && d.videos[0] && (d.videos[0].url || d.videos[0]));
+  if (vUrl) { const v = normVideo(typeof vUrl === 'string' ? vUrl : vUrl.url, 'Video', 0, 'mp4'); if (v) video.push(v); }
+  const aUrl = d.audio || d.audio_url || d.music;
+  if (aUrl) { const a = normAudio(typeof aUrl === 'string' ? aUrl : aUrl.url, 'Audio only', 'm4a'); if (a) audio.push(a); }
+  if (!video.length && !audio.length) return null;
+  return { title: d.title || 'Video', thumbnail: d.thumbnail || d.cover || null, video, audio, source: 'savereelsfast' };
+}
+// FxTwitter (api.fxtwitter.com) — X/Twitter only, no key. User-Agent
+// header is mandatory (401 without it). Returns tweet media variants.
+async function fxTwitterFallback(url) {
+  const m = url.match(/(?:x\.com|twitter\.com)\/([^\/\?]+)\/status\/(\d+)/i);
+  if (!m) return null;
+  const r = await fetchJson('https://api.fxtwitter.com/' + m[1] + '/status/' + m[2], { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36' }, 20000);
+  if (!r.json) return null;
+  const tweet = r.json.tweet || r.json;
+  const media = tweet.media || {};
+  const videos = media.videos || [];
+  const video = [];
+  for (const v of videos) {
+    const u = v.url;
+    if (!u) continue;
+    const item = normVideo(u, (v.height ? v.height + 'p' : 'Video'), v.height || 0, 'mp4');
+    if (item) video.push(item);
+  }
+  if (!video.length) return null;
+  video.sort((a, b) => (b.height || 0) - (a.height || 0));
+  return { title: tweet.text ? String(tweet.text).slice(0, 100) : 'Video', thumbnail: (media.photos && media.photos[0] && media.photos[0].url) || null, video, audio: [], source: 'fxtwitter' };
+}
+// tikwm — TikTok mirror API, no key. GET /api/?url=<tiktok url>.
+// Returns data.play (video), data.music (audio), data.images (carousel).
+async function tikwmFallback(url) {
+  const r = await fetchJson('https://www.tikwm.com/api/?url=' + encodeURIComponent(url), {}, 25000);
+  if (!r.json || r.json.code !== 0 || !r.json.data) return null;
+  const d = r.json.data;
+  const video = [];
+  const audio = [];
+  if (d.play) { const v = normVideo(d.play, 'Video', 0, 'mp4'); if (v) video.push(v); }
+  if (d.music) { const a = normAudio(d.music, 'Audio only', 'mp3'); if (a) audio.push(a); }
+  if (!video.length && !audio.length) return null;
+  return { title: d.title || 'Video', thumbnail: d.cover || d.origin_cover || null, video, audio, source: 'tikwm' };
+}
+// Try the free fallbacks in platform order; first success wins.
+async function tryFallbacks(url) {
+  const p = platformName(url);
+  const chain = [];
+  chain.push({ name: 'saveapi', fn: saveApiFallback });
+  if (p === 'TikTok') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); chain.push({ name: 'tikwm', fn: tikwmFallback }); }
+  else if (p === 'Facebook' || p === 'X') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); if (p === 'X') chain.push({ name: 'fxtwitter', fn: fxTwitterFallback }); }
+  else if (p !== 'Instagram' && p !== 'YouTube') { chain.push({ name: 'savereelsfast', fn: saveReelsFastFallback }); }
+  // Instagram: SaveAPI only. YouTube: dlsrv automation (VPS) — no free API fallback.
+  const tried = [];
+  for (const { name, fn } of chain) {
+    try {
+      const out = await fn(url);
+      tried.push(name + ':' + (out ? 'ok' : 'fail'));
+      if (out) return { ...out, tried };
+    } catch (e) { tried.push(name + ':error'); }
+  }
+  return { tried };
+}
+
 // ---------- app ----------
 
 const app = express();
@@ -458,6 +591,34 @@ app.get('/api/dlsrv-test', async (req, res) => {
     if (browser) { try { await browser.close(); } catch (_) {} }
     return res.json({ ok: false, videoId, ms: Date.now() - t0, error: String(e && e.message || e).slice(0, 300) });
   }
+});
+
+// ---------- GET /api/fallback-test ----------
+// Test the free third-party fallback sources one by one for a URL and
+// report which worked + time. Used to verify SaveAPI / SaveReelsFast /
+// FxTwitter / tikwm from the server (the sandbox cannot reach them).
+//   GET /api/fallback-test?url=<video url>
+app.get('/api/fallback-test', async (req, res) => {
+  const url = (req.query.url || '').trim();
+  if (!/^https?:\/\/.+/i.test(url)) return res.status(400).json({ ok: false, error: 'Provide ?url=https://...' });
+  const t0 = Date.now();
+  const results = {};
+  const tests = [
+    ['saveapi', saveApiFallback],
+    ['savereelsfast', saveReelsFastFallback],
+    ['fxtwitter', fxTwitterFallback],
+    ['tikwm', tikwmFallback],
+  ];
+  for (const [name, fn] of tests) {
+    const s = Date.now();
+    try {
+      const out = await fn(url);
+      results[name] = out
+        ? { ok: true, ms: Date.now() - s, source: out.source, title: (out.title || '').slice(0, 60), video: out.video.length, audio: out.audio.length, videoUrl: out.video[0] ? out.video[0].url.slice(0, 120) : null }
+        : { ok: false, ms: Date.now() - s, reason: 'no result' };
+    } catch (e) { results[name] = { ok: false, ms: Date.now() - s, reason: String(e && e.message || e).slice(0, 120) }; }
+  }
+  res.json({ ok: true, url, platform: platformName(url), ms: Date.now() - t0, saveapi_key_set: !!(process.env.SAVEAPI_KEY || '').trim(), results });
 });
 
 app.get('/', (req, res) => {
@@ -619,8 +780,26 @@ app.post('/api/formats', async (req, res) => {
   }
 
   if (!data) {
+    // THIRD-PARTY FALLBACKS: yt-dlp is blocked from this datacenter IP.
+    // Try the free fallback sources (SaveAPI, SaveReelsFast, FxTwitter,
+    // tikwm) before giving up — no paid links, free tiers only.
+    const fb = await tryFallbacks(url);
+    if (fb && fb.video && (fb.video.length || (fb.audio && fb.audio.length))) {
+      return res.json({
+        ok: true,
+        title: fb.title || 'Video',
+        thumbnail: fb.thumbnail || null,
+        duration: null,
+        uploader: null,
+        extractor: 'fallback:' + (fb.source || 'unknown'),
+        webpage_url: url,
+        formats: { video: fb.video, audio: fb.audio || [] },
+        fallback_source: fb.source || null,
+        fallback_tried: fb.tried || [],
+      });
+    }
     const c = classifyError(lastErr, url);
-    return res.status(200).json({ ok: false, ...c, detail: (lastErr || '').slice(0, 300) });
+    return res.status(200).json({ ok: false, ...c, detail: (lastErr || '').slice(0, 300), fallback_tried: fb.tried || [] });
   }
 
   const formats = buildFormats(data.formats);
